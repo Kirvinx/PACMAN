@@ -60,23 +60,61 @@ class OffensiveAgent(CaptureAgent):
     # ----------------------------
 
     def run_away(self, agent, game_state):
-        """Find a path away from nearest ghost using A*."""
+        """
+        When a ghost is nearby, rerun A* toward a food target that is biased toward safety.
+        Randomly selects among safer foods (further from visible ghosts).
+        """
         my_pos = game_state.get_agent_state(self.index).get_position()
-        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-
-        ghosts = [e.get_position() for e in enemies if e.get_position() and not e.is_pacman]
-        if not ghosts:
+        food_list = self.get_food(game_state).as_list()
+        if not food_list:
             return Directions.STOP
 
-        nearest = min(ghosts, key=lambda g: self.get_maze_distance(my_pos, g))
+        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
+        ghosts = [
+            e.get_position() for e in enemies
+            if e.get_position() and not e.is_pacman and e.scared_timer == 0
+        ]
 
-        # Move away from ghost
-        dx = my_pos[0] - nearest[0]
-        dy = my_pos[1] - nearest[1]
-        target = (my_pos[0] + dx * 2, my_pos[1] + dy * 2)
+        # If no visible ghosts, just do regular food hunting
+        if not ghosts:
+            return self.hunt_food(agent, game_state)
 
-        path = self.pathfinder.find_path(game_state, my_pos, target)
-        return path[0] if path else Directions.STOP
+        # Compute "safety score" for each food
+        food_safety = []
+        for food in food_list:
+            if ghosts:
+                min_dist_to_ghost = min(self.get_maze_distance(food, g) for g in ghosts)
+            else:
+                min_dist_to_ghost = 10  # arbitrary safe distance
+            food_safety.append((food, min_dist_to_ghost))
+
+        # Normalize safety into probabilities
+        total_safety = sum(d for _, d in food_safety)
+        if total_safety == 0:
+            total_safety = 1
+        weights = [d / total_safety for _, d in food_safety]
+
+        # Weighted random choice (favor safer food)
+        chosen_food = random.choices(
+            [f for f, _ in food_safety],
+            weights=weights,
+            k=1
+        )[0]
+
+        # Use A* to get there (danger-aware)
+        path = self.pathfinder.find_path(
+            game_state,
+            my_pos,
+            chosen_food,
+            avoid_enemies=True
+        )
+
+        if path:
+            return path[0]
+
+        # If somehow no path, fallback to STOP
+        return Directions.STOP
+
 
     def return_home(self, agent, game_state):
         """Go back to your side safely using A*."""
