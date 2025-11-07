@@ -54,8 +54,8 @@ class AStarPathfinder:
                            Directions.EAST,
                            Directions.WEST]:
                 dx, dy = Actions.direction_to_vector(action)
-                nx = current_pos[0] + dx
-                ny = current_pos[1] + dy
+                nx = int(current_pos[0] + dx)
+                ny = int(current_pos[1] + dy)
                 next_pos = (nx, ny)
 
                 # Bounds check
