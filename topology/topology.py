@@ -59,6 +59,8 @@ class MapTopologyAnalyzer:
         self._compute_articulation_points()
         self._compute_pocket_regions()
         self._compute_pocket_risks()
+        #self._compute_articulation_proximity(radius=1)
+
 
     # ----------------------------------------------------------------------
     # Public API
@@ -164,7 +166,7 @@ class MapTopologyAnalyzer:
             self.compressed_adj[node] = [(nb, d) for nb, d in uniq.items()]
 
     def _compute_articulation_points(self):
-        """Run Tarjan's algorithm on the compressed graph to find articulation points."""
+        """Run Tarjan’s algorithm on the compressed graph to find articulation points."""
         index, lowlink = {}, {}
         current = [0]
         self.articulation_nodes = set()
@@ -199,6 +201,65 @@ class MapTopologyAnalyzer:
         self.articulation_nodes = {
             n for n in self.articulation_nodes if n not in self.junction_nodes
         }
+
+        # Prune nested / deeper articulation points using compressed graph only
+        self._prune_nested_articulations_on_compressed()
+
+    def _prune_nested_articulations_on_compressed(self):
+        """
+        Keep only 'first layer' articulation nodes: those that touch the main
+        non-articulation component in the compressed graph. Deeper ones are pruned.
+        """
+        if not self.articulation_nodes:
+            return
+
+        # 1) Connected components of NON-articulation compressed nodes
+        comp_id = {}
+        comp_sizes = []
+
+        for node in self.compressed_nodes:
+            if node in self.articulation_nodes or node in comp_id:
+                continue
+
+            cid = len(comp_sizes)
+            stack = [node]
+            comp_id[node] = cid
+            size = 0
+
+            while stack:
+                u = stack.pop()
+                size += 1
+                for v, _ in self.compressed_adj.get(u, []):
+                    if v in self.articulation_nodes or v in comp_id:
+                        continue
+                    comp_id[v] = cid
+                    stack.append(v)
+
+            comp_sizes.append(size)
+
+        if not comp_sizes:
+            return
+
+        # 2) Choose main component (largest non-articulation component)
+        main_comp = max(range(len(comp_sizes)), key=lambda i: comp_sizes[i])
+
+        # 3) Keep only articulations that border the main component
+        filtered = set()
+        for a in self.articulation_nodes:
+            neighbor_comps = set()
+            for v, _ in self.compressed_adj.get(a, []):
+                if v in self.articulation_nodes:
+                    continue
+                cid = comp_id.get(v)
+                if cid is not None:
+                    neighbor_comps.add(cid)
+
+            # "First" articulation layer: has at least one neighbor in main_comp
+            if main_comp in neighbor_comps:
+                filtered.add(a)
+
+        self.articulation_nodes = filtered
+
 
     # ----------------------------------------------------------------------
     # Stage 2: Pockets and risk propagation
@@ -282,3 +343,57 @@ class MapTopologyAnalyzer:
                     visited.add(v)
                     self.pocket_risk_dist[v] = du + 1
                     q.append(v)
+
+    def _compute_articulation_proximity(self, radius=6):
+        """
+        Compute proximity zones *outward toward the main region*.
+
+        Distances are measured from articulation tiles and from
+        dead-ends directly attached to junctions, expanding only
+        into the main pocket (safe region).
+        """
+        if self.main_pocket is None:
+            return
+
+        self.proximity_radius = radius
+        self.proximity_dist = {pos: float('inf') for pos in self.legal_positions}
+        self.near_articulation = set()
+
+        q = deque()
+
+        # --- (1) Articulation doors that open into the main pocket ---
+        for art in self.articulation_nodes:
+            for nb in self.neighbors.get(art, []):
+                if self.pocket_id.get(nb) == self.main_pocket:
+                    self.proximity_dist[art] = 0
+                    q.append(art)
+                    break  # only need to enqueue once
+
+        # --- (2) Dead ends that connect straight to junctions ---
+        for dead in self.dead_end_nodes:
+            nbs = self.neighbors.get(dead, [])
+            if not nbs:
+                continue
+            nb = nbs[0]
+            # Only include if this dead end’s neighbor is a junction
+            # and the junction is part of the main pocket
+            if nb in self.junction_nodes and self.pocket_id.get(nb) == self.main_pocket:
+                self.proximity_dist[dead] = 0
+                q.append(dead)
+
+        # --- (3) BFS expansion into the main pocket only ---
+        while q:
+            u = q.popleft()
+            du = self.proximity_dist[u]
+            if du >= radius:
+                continue
+
+            for v in self.neighbors[u]:
+                # Expand only inside the main pocket
+                if self.pocket_id.get(v) != self.main_pocket:
+                    continue
+                if self.proximity_dist[v] > du + 1:
+                    self.proximity_dist[v] = du + 1
+                    q.append(v)
+                    self.near_articulation.add(v)
+
