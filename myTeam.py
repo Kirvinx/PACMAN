@@ -153,8 +153,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
 
     def _init_offensive_state(self):
         """Initialize offensive-specific state variables."""
-        self.recent_positions = deque(maxlen=8)
-        self.stuck_counter = 0
+        self.recent_positions = deque(maxlen=12)
         self.last_intent = None
         self.deadlock_target = None
         self.deadlock_commit = 0
@@ -199,7 +198,6 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             my_pos = game_state.get_agent_state(self.index).get_position()
             if my_pos:
                 self.recent_positions.append(my_pos)
-            self.stuck_counter = self.stuck_counter + 1 if self._is_stuck() else 0
         
         # Execute behavior tree
         action = self.behavior_tree.execute(self, game_state)
@@ -235,7 +233,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
                 Action(lambda a, gs: a._pursue_deadlock_target(gs))
             ]),
             Sequence([
-                Condition(lambda a, gs: a.stuck_counter >= 3),
+                Condition(lambda a, gs: a._is_stuck()),
                 Action(lambda a, gs: a.break_deadlock(gs))
             ]),
             # Time pressure
@@ -327,12 +325,39 @@ class UnifiedBeliefBTAgent(CaptureAgent):
     # ==================== OFFENSIVE METHODS ====================
 
     def _is_stuck(self):
-        """Detect movement deadlocks."""
-        if len(self.recent_positions) < self.recent_positions.maxlen:
-            return False
+        """
+        Detect movement deadlocks by checking if the last positions
+        consist of a short cycle repeated at least 3 times.
+
+        Examples that return True:
+        - AAA                  (k=1, A|A|A)
+        - ABABABAB             (k=2, AB|AB|AB in the tail)
+        - ABCABCABC            (k=3, ABC|ABC|ABC)
+        - ABCDABCDABCD         (k=4, ABCD|ABCD|ABCD)  # if maxlen >= 12
+        """
         pos = list(self.recent_positions)
-        return (pos[-4:] == pos[-3:] + [pos[-1]]) or \
-               (pos[-4] == pos[-2] and pos[-3] == pos[-1] and pos[-4] != pos[-3])
+        n = len(pos)
+
+        # allow cycle lengths up to 4, but not more than n//3
+        max_cycle_len = min(4, n // 3)
+        if max_cycle_len == 0:
+            return False
+
+        for k in range(1, max_cycle_len + 1):
+            needed = 3 * k
+            if n < needed:
+                continue
+
+            start = n - needed
+            block1 = pos[start : start + k]
+            block2 = pos[start + k : start + 2*k]
+            block3 = pos[start + 2*k : start + 3*k]
+
+            if block1 == block2 == block3:
+                return True
+
+        return False
+
 
     def _two_offensive_agents(self, game_state):
         """Check if 2+ agents are offensive."""
@@ -340,10 +365,36 @@ class UnifiedBeliefBTAgent(CaptureAgent):
                   if self.ctx.modes.get(i, "offense") == "offense") >= 2
 
     def _should_retreat(self, game_state):
-        """Check if retreat needed."""
-        return (self.is_on_enemy_side(game_state) and 
-                not self.is_power_active(game_state) and 
-                self.ghost_nearby(game_state, 5))
+        pos = game_state.get_agent_state(self.index).get_position()
+        if not pos:
+            return False
+
+        # first, normal logic outside trap
+        if not self.topology.is_in_trap_region(pos):
+            return (self.is_on_enemy_side(game_state) and
+                    not self.is_power_active(game_state) and
+                    self.ghost_nearby(game_state, 5))
+
+        # ---------- TRAP logic ----------
+        # inside a trap: even scared ghosts matter
+        pocket = self.topology.pocket_id.get(pos)
+        exits = list(self.topology.pocket_exits[pocket])
+        door = min(exits, key=lambda e: self.get_maze_distance(pos, e))
+
+        # Pacman's time to escape
+        pac_time = self.get_maze_distance(pos, door)
+
+        # Ghost time to become dangerous at door
+        min_ghost_time = float("inf")
+        for opp in self.opponents:
+            st = game_state.get_agent_state(opp)
+            gpos = st.get_position() if st else None
+            if gpos:
+                t = self._ghost_danger_time(game_state, gpos, st, door)
+                min_ghost_time = min(min_ghost_time, t)
+
+        # Retreat if we can't escape in time
+        return pac_time >= min_ghost_time
 
     def ghost_nearby(self, game_state, radius):
         """Check if dangerous ghost within radius."""
@@ -359,9 +410,10 @@ class UnifiedBeliefBTAgent(CaptureAgent):
                     return True
         return False
 
+
     def break_deadlock(self, game_state):
         """Handle deadlock situations."""
-        self.stuck_counter = 0
+        history = list(self.recent_positions)
         self.recent_positions.clear()
         
         my_pos = game_state.get_agent_state(self.index).get_position()
@@ -369,6 +421,30 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             return Directions.STOP
         
         if self.is_on_enemy_side(game_state):
+            cycle_crosses_home = any(
+                self._is_on_home_side_pos(game_state, p) for p in history
+            )
+
+            # If cycle crossed home-side, treat this like defensive deadlock
+            if cycle_crosses_home:
+                border_x = self.mid_x - 1 if self.red else self.mid_x
+                border_tiles = [(border_x, y) for y in range(self.map_height)
+                                if not game_state.get_walls()[border_x][y]]
+
+                far_tiles = [t for t in border_tiles
+                            if self.get_maze_distance(my_pos, t) >= self.MIN_DEADLOCK_DIST]
+
+                target = random.choice(far_tiles or border_tiles)
+                self.deadlock_target = target
+                self.deadlock_commit = self.DEADLOCK_COMMIT
+
+                path = self.pathfinder.find_path(
+                    game_state, my_pos, target,
+                    avoid_enemies=True     
+                )
+                if path:
+                    return path[0]
+            
             if self.last_intent != "run_home" and self.deadlock == 0:
                 self.deadlock = 1
                 return self._escape_best_option(game_state)
@@ -559,24 +635,46 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         return all(self.get_maze_distance(g, door) > required_dist for g in ghosts)
 
     def _should_abort_trap(self, game_state, my_pos):
-        """Check if should abort trap."""
         pocket = self.topology.pocket_id.get(my_pos)
         if not pocket or pocket not in self.topology.off_pockets:
             return False
-        
-        if self.topology.trap_depth(my_pos) <= 0:
-            return False
-        
+
         exits = list(self.topology.pocket_exits[pocket])
         door = min(exits, key=lambda e: self.get_maze_distance(my_pos, e))
-        
-        ghosts = self._get_visible_ghosts(game_state)
-        if not ghosts:
+
+        pac_time = self.get_maze_distance(my_pos, door)
+
+        # default: allow a configurable extra margin if you want
+        pac_time += self.TRAP_ABORT_THRESHOLD
+
+        min_ghost_time = float("inf")
+
+        for opp in self.opponents:
+            st = game_state.get_agent_state(opp)
+            gpos = st.get_position() if st else None
+            if gpos:
+                t = self._ghost_danger_time(game_state, gpos, st, door)
+                min_ghost_time = min(min_ghost_time, t)
+
+        if min_ghost_time == float("inf"):
             return False
-        
-        pac_dist = self.get_maze_distance(my_pos, door)
-        ghost_dist = min(self.get_maze_distance(g, door) for g in ghosts)
-        return ghost_dist <= pac_dist + self.TRAP_ABORT_THRESHOLD
+
+        return pac_time >= min_ghost_time
+
+    
+    def _ghost_danger_time(self, game_state, ghost_pos, ghost_state, door):
+        if not ghost_state or ghost_state.is_pacman or not ghost_pos:
+            return float("inf")
+
+        g_dist = self.get_maze_distance(ghost_pos, door)
+
+        # seconds/ticks → convert to steps
+        scared = ghost_state.scared_timer
+        scared_steps = scared  if scared > 0 else 0
+        # Ghost becomes lethal at door after:
+        #   1. reaching door (g_dist)
+        #   2. no longer scared (scared_steps)
+        return max(g_dist, scared_steps)
 
     def _begin_trap_escape(self, game_state):
         """Start trap escape sequence."""
@@ -1371,4 +1469,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
 4. Dynamic carry threshold instead of a fixed CARRY_THRESHOLD
 6. Smarter “food escape” when running away (specifically ghost proximity)
 """
+
+
+#TODO: IF GETTING CHASED TOO LONG AND NOT GETTING ANY FOOD => RETURN HOME (POTENTIONALLY SOME FOOD LEVEL DANGER LOGIC / being chased?)
 
