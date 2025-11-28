@@ -32,6 +32,14 @@ class UnifiedBeliefBTAgent(CaptureAgent):
     TRAP_ABORT_THRESHOLD = 5
     TIME_SAFETY_FACTOR = 1.5
     TICKS_PER_STEP = 4
+
+    DIR2DELTA = {
+        Directions.NORTH: (0, 1),
+        Directions.SOUTH: (0, -1),
+        Directions.EAST:  (1, 0),
+        Directions.WEST:  (-1, 0),
+    }
+
     
     # Shared state across all agents
     shared_modes = {}
@@ -370,7 +378,9 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             self.deadlock_commit = self.DEADLOCK_COMMIT
             
             path = self.defensive_pathfinder.find_path(
-                game_state, my_pos, target, avoid_allies=False, return_cost=False
+                game_state, my_pos, target,
+                avoid_path_tiles=None,       
+                lambda_path_overlap=100.0
             )
             if path:
                 return path[0]
@@ -385,13 +395,20 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             self._clear_deadlock()
             return Directions.STOP
         
-        pathfinder = (self.pathfinder if self.is_on_enemy_side(game_state) 
-                     else self.defensive_pathfinder)
-        path = (pathfinder.find_path(game_state, my_pos, self.deadlock_target, avoid_enemies=True)
-                if self.is_on_enemy_side(game_state)
-                else pathfinder.find_path(game_state, my_pos, self.deadlock_target, 
-                                        avoid_allies=False, return_cost=False))
-        
+        if self.is_on_enemy_side(game_state):
+            # Offensive-side deadlock pursuit uses offensive A*
+            path = self.pathfinder.find_path(
+                game_state, my_pos, self.deadlock_target,
+                avoid_enemies=True       # offensive pathfinder signature stays the same
+            )
+        else:
+            # Defensive-side deadlock pursuit uses NEW defensive A*
+            path = self.defensive_pathfinder.find_path(
+                game_state, my_pos, self.deadlock_target,
+                avoid_path_tiles=None,   # No teammate avoidance in deadlock mode
+                lambda_path_overlap=0.0  # No penalty
+            )
+                
         if path:
             self.deadlock_commit -= 1
             if self.get_maze_distance(my_pos, self.deadlock_target) <= 1:
@@ -996,7 +1013,6 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         return (safe or candidates)[0][0]
 
     def _intercept_invader(self, game_state):
-        """Intercept invaders using visible positions or belief peaks."""
         if self._is_scared(game_state):
             threat_info = self._closest_visible_intruder(game_state, max_manhattan=5)
             if threat_info:
@@ -1020,7 +1036,6 @@ class UnifiedBeliefBTAgent(CaptureAgent):
                 opp_state = game_state.get_agent_state(opp)
                 if not opp_state or not opp_state.is_pacman:
                     continue
-
                 belief = self.belief_tracker.get_belief(opp)
                 if belief:
                     best_pos = max(belief.items(), key=lambda kv: kv[1])[0]
@@ -1036,10 +1051,12 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         cls.shared_targets[self.index] = target
         cls.shared_interceptor = self.index
 
+        avoid_tiles = self._predicted_teammate_path_tiles(game_state, target)
+
         path = self.defensive_pathfinder.find_path(
             game_state, my_pos, target,
-            avoid_allies=False, lambda_ally=0.0,
-            repulsion_radius=0, decay_alpha=0.0
+            avoid_path_tiles=avoid_tiles,
+            lambda_path_overlap=100.0,
         )
 
         legal = game_state.get_legal_actions(self.index)
@@ -1058,6 +1075,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
                         best_dist, best_action = d, action
         return best_action
 
+
     def _patrol_single(self, game_state):
         """Single defender patrol logic."""
         legal = game_state.get_legal_actions(self.index)
@@ -1071,21 +1089,25 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         if self.__class__.shared_interceptor == self.index:
             self.__class__.shared_interceptor = None
 
+        # Check for visible enemies
         enemy_positions = [
             game_state.get_agent_position(opp)
             for opp in self.opponents
             if game_state.get_agent_position(opp)
         ]
 
+        # MODE A: Enemy visible - use entrance priority
         if enemy_positions:
             self.patrol_target = None
             border_x = self._home_border_x(game_state)
-
+            
+            # Get valid successor positions
             action_succ = [
                 (action, game_state.generate_successor(self.index, action).get_agent_position(self.index))
                 for action in legal
             ]
-
+            
+            # Filter to home side
             filtered = [
                 (action, pos) for action, pos in action_succ
                 if pos and ((self.red and pos[0] <= border_x) or (not self.red and pos[0] >= border_x))
@@ -1097,12 +1119,13 @@ class UnifiedBeliefBTAgent(CaptureAgent):
                 return best_action
             return Directions.STOP
 
+        # MODE B: No visible enemy - belief-driven patrol
         entrances = self.territory.entrances
         if not entrances:
             return Directions.STOP
 
         belief_positions = self._belief_enemy_positions()
-
+        
         if belief_positions:
             d_opp = self.territory._compute_enemy_distances_to_entrances(belief_positions)
             best_idx = min(range(len(entrances)), key=lambda i: d_opp[i])
@@ -1111,9 +1134,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             patrol_target = entrances[hash(game_state) % len(entrances)]
 
         path = self.defensive_pathfinder.find_path(
-            game_state, my_pos, patrol_target,
-            avoid_allies=False, lambda_ally=0.0,
-            repulsion_radius=0, decay_alpha=0.0
+            game_state, my_pos, patrol_target
         )
 
         if path and path[0] in legal:
@@ -1142,15 +1163,17 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         if not group_a or not group_b:
             return self._patrol_single(game_state)
 
+        # Get assigned group
         my_group = self.__class__.shared_group_assignment.get(self.index)
         if not my_group:
             return self._patrol_single(game_state)
 
         my_group_indices = group_a if my_group == "A" else group_b
         assigned_entrances = [entrances[i] for i in my_group_indices]
-
+        #self._debug_draw_entrance_split( assigned_entrances)
+        # Pick patrol target
         belief_positions = self._belief_enemy_positions()
-
+        
         if belief_positions:
             d_opp = self.territory._compute_enemy_distances_to_entrances(belief_positions)
             best_idx = min(my_group_indices, key=lambda i: d_opp[i])
@@ -1160,14 +1183,14 @@ class UnifiedBeliefBTAgent(CaptureAgent):
                               key=lambda p: self.get_maze_distance(my_pos, p))
 
         path = self.defensive_pathfinder.find_path(
-            game_state, my_pos, patrol_target,
-            avoid_allies=False, lambda_ally=2.0,
-            repulsion_radius=3, decay_alpha=0.5
+            game_state, my_pos, patrol_target
         )
 
         if path and path[0] in legal:
             return path[0]
         return Directions.STOP
+
+
 
     def _compute_home_entries(self, game_state):
         """Return border tiles that open to enemy side."""
@@ -1270,3 +1293,67 @@ class UnifiedBeliefBTAgent(CaptureAgent):
                     if pos:
                         return idx, pos, self.__class__.shared_targets.get(idx)
         return None
+
+    def _path_to_positions(self, start_pos, actions):
+        x, y = start_pos
+        tiles = []
+        for a in actions:
+            if a not in self.DIR2DELTA:
+                continue
+            dx, dy = self.DIR2DELTA[a]
+            x += dx
+            y += dy
+            tiles.append((x, y))
+        return tiles
+    
+    def _predicted_teammate_path_tiles(self, game_state, target):
+        if not self._two_defenders_active(game_state):
+            return None
+
+        teammate_info = self._get_defensive_teammate_info(game_state)
+        if not teammate_info:
+            return None
+
+        mate_idx, mate_pos, mate_target = teammate_info
+        my_pos = game_state.get_agent_position(self.index)
+
+        if not my_pos or not mate_pos or not target:
+            return None
+
+        d_self = self.get_maze_distance(my_pos, target)
+        d_mate = self.get_maze_distance(mate_pos, target)
+
+        i_am_leader = (
+            d_self < d_mate or
+            (d_self == d_mate and self.index < mate_idx)
+        )
+
+        if i_am_leader:
+            return None
+
+        mate_path = self.defensive_pathfinder.find_path(
+            game_state,
+            start=mate_pos,
+            goal=target
+        )
+
+        if not mate_path:
+            return None
+
+        tiles = self._path_to_positions(mate_pos, mate_path)
+
+        if tiles:
+            tiles = tiles[:-1]
+
+        return set(tiles)
+
+
+#TODO: MAKE THE 2 DEFENDERS WORK TOGETHER BETTER
+#TODO: AFTERWARDS, BETTER SWITCHING BETWEEN THEM
+#TODO: CONSIDER ON OFFENSE
+"""
+3. Capsule planning on offense, not only in escape
+4. Dynamic carry threshold instead of a fixed CARRY_THRESHOLD
+6. Smarter “food escape” when running away (specifically ghost proximity)
+"""
+
