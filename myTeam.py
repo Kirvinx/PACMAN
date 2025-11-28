@@ -17,13 +17,39 @@ from contest.agents.team_name_1.beliefline.pathfinding_defensive import Defensiv
 from contest.agents.team_name_1.beliefline.belief_shared import GhostBeliefTracker
 from contest.distance_calculator import Distancer
 
+class TeamContext:
+    def __init__(self, game_state, team_indices, opponents, is_red, agent):
+        self.team_indices = tuple(sorted(team_indices))
+        self.opponents = opponents
+        self.is_red = is_red
+
+        self.modes = {}           
+        self.targets = {}
+        self.interceptor = None
+        self.group_assignment = {}
+        self.last_assignment_turn = -1
+
+        # Distancer shared for this team+layout
+        self.distancer = Distancer(game_state.data.layout)
+        self.distancer.get_maze_distances()
+
+        # Belief tracker shared for this team
+        self.belief_tracker = GhostBeliefTracker(
+            agent=agent,              # first agent becomes "owner" for debugging etc.
+            opponents=opponents,
+            team_indices=team_indices,
+        )
+        self.belief_tracker.initialize_uniformly(game_state)
+
+
 
 class UnifiedBeliefBTAgent(CaptureAgent):
     """
     Unified agent that dynamically switches between offensive and defensive roles
     based on game state, using belief tracking and behavior trees.
     """
-    
+    _contexts = {}
+
     # Offensive constants
     CARRY_THRESHOLD = 10
     ESCAPE_PELLET_RISK_FACTOR = 0.9
@@ -40,36 +66,45 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         Directions.WEST:  (-1, 0),
     }
 
-    
-    # Shared state across all agents
-    shared_modes = {}
-    shared_targets = {}
-    shared_belief_tracker = None
-    shared_interceptor = None
-    shared_group_assignment = {}
-    shared_last_assignment_turn = -1
-    shared_distancer = None
 
     def register_initial_state(self, game_state):
         super().register_initial_state(game_state)
-        
-        # Reset shared state at game start
+
         cls = self.__class__
-        cls.shared_modes = {}
-        cls.shared_targets = {}
-        cls.shared_interceptor = None
-        cls.shared_group_assignment = {}
-        cls.shared_last_assignment_turn = -1
-        
-        # Initialize common components
+
+        # ----- compute a unique key for this game+team -----
+        game_id = id(game_state.data)  # unique per game instance
+        team_indices = tuple(sorted(self.get_team(game_state)))
+        ctx_key = (game_id, team_indices)
+
+        # ----- create context if first time for this game+team -----
+        if ctx_key not in cls._contexts:
+            ctx = TeamContext(
+                game_state=game_state,
+                team_indices=team_indices,
+                opponents=self.get_opponents(game_state),
+                is_red=self.red,
+                agent=self,   # first agent becomes the 'agent' for the tracker
+            )
+            cls._contexts[ctx_key] = ctx
+        else:
+            ctx = cls._contexts[ctx_key]
+            # refresh belief tracker links for this game
+            ctx.belief_tracker.debug_agent = self
+            ctx.belief_tracker.opponents = self.get_opponents(game_state)
+            ctx.belief_tracker.team_indices = self.get_team(game_state)
+            ctx.belief_tracker.initialize_uniformly(game_state)
+
+        # store on the instance
+        self.ctx = ctx
+
+        # Common per-agent setup (map, topology, pathfinders, etc.)
         self._init_common_components(game_state)
-        
-        # Initialize offensive-specific state
+
+        # local per-agent state (deadlock, trap, etc.)
         self._init_offensive_state()
-        
-        # Initialize defensive-specific state
         self._init_defensive_state(game_state)
-        
+            
         # Build behavior trees
         self.offense_tree = self._build_offense_tree()
         self.defense_tree = self._build_defense_tree()
@@ -89,6 +124,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         # Start with offensive mode by default
         self.mode = "offense"
 
+
     def _init_common_components(self, game_state):
         """Initialize components shared between offensive and defensive modes."""
         # Cache game constants
@@ -97,11 +133,11 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         self.map_height = walls.height
         self.mid_x = self.map_width // 2
         
-        # Team information
-        self.team_indices = self.get_team(game_state)
-        self.opponents = self.get_opponents(game_state)
+        # Team information from context
+        self.team_indices = self.ctx.team_indices
+        self.opponents = self.ctx.opponents
         
-        # Initialize analyzers and pathfinders
+        # Initialize analyzers and pathfinders (per agent)
         self.topology = MapTopologyAnalyzer(walls)
         self.pathfinder = AStarPathfinder(self)
         self.defensive_pathfinder = DefensiveAStarPathfinder(self)
@@ -110,30 +146,10 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         self.territory = TerritoryAnalyzer(game_state, self.red)
         self.home_entries = self._compute_home_entries(game_state)
         
-        # Initialize shared Distancer
-        cls = self.__class__
-        if cls.shared_distancer is None:
-            cls.shared_distancer = Distancer(game_state.data.layout)
-            cls.shared_distancer.get_maze_distances()
-        self.distancer = cls.shared_distancer
-        
-        # Initialize or reuse belief tracker
-        if not cls.shared_belief_tracker:
-            tracker = GhostBeliefTracker(
-                agent=self,
-                opponents=self.opponents,
-                team_indices=self.team_indices
-            )
-            tracker.initialize_uniformly(game_state)
-            cls.shared_belief_tracker = tracker
-        else:
-            tracker = cls.shared_belief_tracker
-            tracker.debug_agent = self
-            tracker.opponents = self.opponents
-            tracker.team_indices = self.team_indices
-            tracker.initialize_uniformly(game_state)
-        
-        self.belief_tracker = cls.shared_belief_tracker
+        # Shared Distancer and BeliefTracker from context
+        self.distancer = self.ctx.distancer
+        self.belief_tracker = self.ctx.belief_tracker
+
 
     def _init_offensive_state(self):
         """Initialize offensive-specific state variables."""
@@ -157,9 +173,8 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         self._update_mode(game_state)
         
         # Update shared mode
-        cls = self.__class__
-        cls.shared_modes[self.index] = self.mode
-        
+        self.ctx.modes[self.index] = self.mode
+
         # Advance motion model (only lowest index agent)
         is_leader = self.index == min(self.team_indices)
         if is_leader:
@@ -205,9 +220,9 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         defender = team[1]
 
         if self.index == attacker:
-            self.mode = "offense"
-        else:
             self.mode = "defense"
+        else:
+            self.mode = "offense"
 
     # ==================== OFFENSIVE BEHAVIOR TREE ====================
 
@@ -322,7 +337,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
     def _two_offensive_agents(self, game_state):
         """Check if 2+ agents are offensive."""
         return sum(1 for i in self.team_indices 
-                  if self.__class__.shared_modes.get(i, "offense") == "offense") >= 2
+                  if self.ctx.modes.get(i, "offense") == "offense") >= 2
 
     def _should_retreat(self, game_state):
         """Check if retreat needed."""
@@ -461,7 +476,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         if not target:
             return self.return_home(game_state) if dual and self.is_on_enemy_side(game_state) else Directions.STOP
         
-        self.__class__.shared_targets[self.index] = target
+        self.ctx.targets[self.index] = target
         
         if (self.topology.is_in_trap_region(target) and 
             not self._safe_to_enter_trap(game_state, my_pos, target)):
@@ -925,7 +940,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
     def _two_defenders_active(self, game_state):
         """Check if 2+ defenders active."""
         count = sum(1 for idx in self.team_indices 
-                   if self.__class__.shared_modes.get(idx) == "defense")
+                   if self.ctx.modes.get(idx) == "defense")
         return count >= 2
 
     def _am_primary_interceptor(self, game_state):
@@ -1047,9 +1062,8 @@ class UnifiedBeliefBTAgent(CaptureAgent):
 
         target = min(intruder_targets, key=lambda p: self.get_maze_distance(my_pos, p))
 
-        cls = self.__class__
-        cls.shared_targets[self.index] = target
-        cls.shared_interceptor = self.index
+        self.ctx.targets[self.index] = target
+        self.ctx.interceptor = self.index
 
         avoid_tiles = self._predicted_teammate_path_tiles(game_state, target)
 
@@ -1086,8 +1100,8 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         if not my_pos:
             return Directions.STOP
 
-        if self.__class__.shared_interceptor == self.index:
-            self.__class__.shared_interceptor = None
+        if self.ctx.interceptor == self.index:
+            self.ctx.interceptor = None
 
         # Check for visible enemies
         enemy_positions = [
@@ -1164,7 +1178,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             return self._patrol_single(game_state)
 
         # Get assigned group
-        my_group = self.__class__.shared_group_assignment.get(self.index)
+        my_group = self.ctx.group_assignment.get(self.index)
         if not my_group:
             return self._patrol_single(game_state)
 
@@ -1205,10 +1219,12 @@ class UnifiedBeliefBTAgent(CaptureAgent):
     def _get_defensive_teammate_info(self, game_state):
         """Get info for another defensive teammate."""
         for idx in self.team_indices:
-            if idx != self.index and self.__class__.shared_modes.get(idx) == "defense":
-                return (idx, 
-                       game_state.get_agent_position(idx),
-                       self.__class__.shared_targets.get(idx))
+            if idx != self.index and self.ctx.modes.get(idx) == "defense":
+                return (
+                    idx,
+                    game_state.get_agent_position(idx),
+                    self.ctx.targets.get(idx),
+                )
         return None
 
     def _belief_enemy_positions(self):
@@ -1231,7 +1247,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         defenders = [
             (idx, game_state.get_agent_position(idx))
             for idx in self.team_indices
-            if self.__class__.shared_modes.get(idx) == "defense"
+            if self.ctx.modes.get(idx) == "defense"
             and game_state.get_agent_position(idx)
         ]
 
@@ -1249,7 +1265,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         cost2 = dist_to_group(pos1, group_b) + dist_to_group(pos2, group_a)
 
         assignment = {idx1: "A", idx2: "B"} if cost1 <= cost2 else {idx1: "B", idx2: "A"}
-        self.__class__.shared_group_assignment = assignment
+        self.ctx.group_assignment = assignment
 
     # ==================== HELPER METHODS ====================
 
@@ -1286,12 +1302,12 @@ class UnifiedBeliefBTAgent(CaptureAgent):
     def _get_teammate_info(self, game_state):
         """Get offensive teammate info."""
         for idx in self.team_indices:
-            if idx != self.index and self.__class__.shared_modes.get(idx) == "offense":
+            if idx != self.index and self.ctx.modes.get(idx, "offense") == "offense":
                 st = game_state.get_agent_state(idx)
                 if st:
                     pos = st.get_position()
                     if pos:
-                        return idx, pos, self.__class__.shared_targets.get(idx)
+                        return idx, pos, self.ctx.targets.get(idx)
         return None
 
     def _path_to_positions(self, start_pos, actions):
@@ -1348,9 +1364,8 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         return set(tiles)
 
 
-#TODO: MAKE THE 2 DEFENDERS WORK TOGETHER BETTER
 #TODO: AFTERWARDS, BETTER SWITCHING BETWEEN THEM
-#TODO: CONSIDER ON OFFENSE
+#TODO: CONSIDER ON OFFENSE:
 """
 3. Capsule planning on offense, not only in escape
 4. Dynamic carry threshold instead of a fixed CARRY_THRESHOLD
