@@ -29,8 +29,6 @@ class TeamContext:
         self.group_assignment = {}
         self.last_assignment_turn = -1
 
-        self.food_danger = {}   # (x, y) -> danger score
-
         # Distancer shared for this team+layout
         self.distancer = Distancer(game_state.data.layout)
         self.distancer.get_maze_distances()
@@ -60,8 +58,6 @@ class UnifiedBeliefBTAgent(CaptureAgent):
     TRAP_ABORT_THRESHOLD = 5
     TIME_SAFETY_FACTOR = 1.5
     TICKS_PER_STEP = 4
-    MAX_CYCLE_LEN = 6            # detect cycle lengths up to 6
-    DEADLOCK_HISTORY_LEN = MAX_CYCLE_LEN * 3    # must be >= 3 * MAX_CYCLE_LEN
 
     DIR2DELTA = {
         Directions.NORTH: (0, 1),
@@ -154,12 +150,10 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         self.distancer = self.ctx.distancer
         self.belief_tracker = self.ctx.belief_tracker
 
-        self._init_food_danger_cache(game_state)
-
 
     def _init_offensive_state(self):
         """Initialize offensive-specific state variables."""
-        self.recent_positions = deque(maxlen=self.DEADLOCK_HISTORY_LEN)
+        self.recent_positions = deque(maxlen=12)
         self.last_intent = None
         self.deadlock_target = None
         self.deadlock_commit = 0
@@ -339,14 +333,13 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         - AAA                  (k=1, A|A|A)
         - ABABABAB             (k=2, AB|AB|AB in the tail)
         - ABCABCABC            (k=3, ABC|ABC|ABC)
-        - ABCDABCDABCD         (k=4, ABCD|ABCD|ABCD)
-        - (extended) 6-length cycles if history >= 18
+        - ABCDABCDABCD         (k=4, ABCD|ABCD|ABCD)  # if maxlen >= 12
         """
         pos = list(self.recent_positions)
         n = len(pos)
 
-        # allow cycle lengths up to MAX_CYCLE_LEN, but not more than n//3
-        max_cycle_len = min(self.MAX_CYCLE_LEN, n // 3)
+        # allow cycle lengths up to 4, but not more than n//3
+        max_cycle_len = min(4, n // 3)
         if max_cycle_len == 0:
             return False
 
@@ -357,8 +350,8 @@ class UnifiedBeliefBTAgent(CaptureAgent):
 
             start = n - needed
             block1 = pos[start : start + k]
-            block2 = pos[start + k : start + 2 * k]
-            block3 = pos[start + 2 * k : start + 3 * k]
+            block2 = pos[start + k : start + 2*k]
+            block3 = pos[start + 2*k : start + 3*k]
 
             if block1 == block2 == block3:
                 return True
@@ -780,103 +773,31 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         if not my_pos:
             return Directions.STOP
         
-        # Trap abort logic stays as is
         if self._should_abort_trap(game_state, my_pos):
             return self._begin_trap_escape(game_state)
         
         close_ghosts = []
-        min_ghost_dist = None
-
-        # Collect visible dangerous ghosts within radius 5
+        immediate = False
         for opp in self.opponents:
             st = game_state.get_agent_state(opp)
             if self._is_dangerous_ghost(st):
                 pos = st.get_position()
                 if pos:
                     dist = self.get_maze_distance(my_pos, pos)
+                    if dist <= 1:
+                        immediate = True
                     if dist <= 5:
                         close_ghosts.append(pos)
-                        if min_ghost_dist is None or dist < min_ghost_dist:
-                            min_ghost_dist = dist
-
-        # === NEW PART 1: "no safe progress" → always go home ===
-        # If we are being chased (ghost in [1..5]) and there is no
-        # consumable that is safe under the formula, we should just bail.
-        if close_ghosts and min_ghost_dist is not None:
-            if not self._has_safe_progress_consumable_for_chase(game_state, min_ghost_dist):
-                return self._escape_best_option(game_state)
-
+        
         carrying = game_state.get_agent_state(self.index).num_carrying
         p_home = min(1.0, float(carrying) / max(1, self.CARRY_THRESHOLD))
         
-        # Existing aggressive home decision still applies
-        """
-        if random.random() < p_home:
-            print("huh")
+        if immediate or len(close_ghosts) >= 2 or random.random() < p_home:
             return self._escape_best_option(game_state)
-        """
         
-         # === NEW PART 2: when kiting food/capsules under chase ===
         food_list = self.get_food(game_state).as_list()
-        capsules = self.get_capsules(game_state)
-
-        # If we see a chaser in visible radius, use danger-aware logic
-        if close_ghosts and min_ghost_dist is not None:
-            # 1) Filter for safe food given current chase distance
-            safe_food = []
-            for f in food_list:
-                danger = self.get_food_danger(f)
-                if self._is_danger_safe_with_chaser(danger, min_ghost_dist):
-                    safe_food.append(f)
-
-            # 1a) If there is any safe food, kite towards that (ignore capsules)
-            if safe_food:
-                weights = [
-                    (f, max(1, self.get_maze_distance(my_pos, f)) ** 2)
-                    for f in safe_food
-                ]
-                total = sum(w for _, w in weights)
-                if total > 0:
-                    r = random.uniform(0, total)
-                    acc = 0
-                    for f, w in weights:
-                        acc += w
-                        if r <= acc:
-                            path = self.pathfinder.find_path(
-                                game_state, my_pos, f, avoid_enemies=True
-                            )
-                            if path:
-                                return path[0]
-                            break
-
-                # If for some reason we failed to path to safe food, bail home
-                return self._escape_best_option(game_state)
-
-            # 1b) No safe food. If there is at least one capsule, that is the
-            #     only way to make progress → we MUST go for a capsule.
-            if capsules:
-                # simple choice: nearest capsule
-                target_capsule = min(
-                    capsules, key=lambda c: self.get_maze_distance(my_pos, c)
-                )
-                path = self.pathfinder.find_path(
-                    game_state, my_pos, target_capsule, avoid_enemies=True
-                )
-                if path:
-                    return path[0]
-
-                # Capsule exists but no path? Then just bail.
-                return self._escape_best_option(game_state)
-
-            # 1c) No safe food and no capsules → no progress possible → go home
-            return self._escape_best_option(game_state)
-
-        # === Not actively chased (no close_ghosts) → old food-kiting behaviour ===
         if food_list:
-            weights = [
-                (f, max(1, self.get_maze_distance(my_pos, f)) ** 2)
-                for f in food_list
-            ]
+            weights = [(f, max(1, self.get_maze_distance(my_pos, f))**2) for f in food_list]
             total = sum(w for _, w in weights)
             if total > 0:
                 r = random.uniform(0, total)
@@ -884,16 +805,12 @@ class UnifiedBeliefBTAgent(CaptureAgent):
                 for f, w in weights:
                     acc += w
                     if r <= acc:
-                        path = self.pathfinder.find_path(
-                            game_state, my_pos, f, avoid_enemies=True
-                        )
+                        path = self.pathfinder.find_path(game_state, my_pos, f, avoid_enemies=True)
                         if path:
                             return path[0]
                         break
-
-        # No good food target → escape towards home/pellet
+        
         return self._escape_best_option(game_state)
-
 
     def _escape_best_option(self, game_state):
         """Find best escape route."""
@@ -1053,86 +970,6 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         required_time = best_path_len * self.TIME_SAFETY_FACTOR * self.TICKS_PER_STEP
 
         return required_time >= time_left
-
-    def _is_on_enemy_side_pos(self, game_state, pos):
-        if not pos:
-            return False
-        mid_x = game_state.get_walls().width // 2
-        return pos[0] >= mid_x if self.red else pos[0] < mid_x
-
-    def _init_food_danger_cache(self, game_state):
-        """
-        Precompute per-tile danger values based purely on topology
-        and store in the shared TeamContext. This is layout-static.
-        """
-        # If another agent already did this for the team, reuse it
-        if getattr(self.ctx, "food_danger", None):
-            return
-
-        danger = {}
-        walls = game_state.get_walls()
-        W, H = walls.width, walls.height
-
-        for x in range(W):
-            for y in range(H):
-                if walls[x][y]:
-                    continue
-                pos = (x, y)
-
-                # Only care about enemy side tiles for offensive food
-                if not self._is_on_enemy_side_pos(game_state, pos):
-                    continue
-
-                depth = self.topology.trap_depth(pos)
-                if depth > 0:
-                    danger[pos] = depth  # you can add scaling later if you want
-
-        self.ctx.food_danger = danger
-
-    def get_food_danger(self, pos):
-        """Fast lookup: danger level of a given food position."""
-        return self.ctx.food_danger.get(pos, 0)
-    
-    def _is_danger_safe_with_chaser(self, danger, chaser_dist):
-        """
-        Returns True if a consumable with given `danger` is safe to pursue
-        while a chasing ghost is `chaser_dist` steps away.
-
-        Rule:
-            - if danger == 0 → always safe
-            - if danger >= 1 → safe iff chaser_dist >= 2*danger + 1
-        """
-        if danger <= 0:
-            return True
-        return chaser_dist >= 2 * danger + 1
-
-    def _has_safe_progress_consumable_for_chase(self, game_state, min_ghost_dist):
-        """
-        Returns True if, at current chase distance, there is any consumable
-        (food or capsule) that is realistically safe/worth pursuing.
-
-        - Food:
-            danger d is safe iff _is_danger_safe_with_chaser(d, min_ghost_dist) is True.
-        - Capsules:
-            treated as always preserving progress potential, even if in traps.
-        """
-        food_list = self.get_food(game_state).as_list()
-        capsules = self.get_capsules(game_state)
-
-        # Capsules "solve the problem" even if they're in traps.
-        if capsules:
-            return True
-
-        if not food_list:
-            return False
-
-        for f in food_list:
-            danger = self.get_food_danger(f)
-            if self._is_danger_safe_with_chaser(danger, min_ghost_dist):
-                return True
-
-        return False
-
 
     # ==================== DEFENSIVE METHODS ====================
 
@@ -1628,9 +1465,11 @@ class UnifiedBeliefBTAgent(CaptureAgent):
 #TODO: AFTERWARDS, BETTER SWITCHING BETWEEN THEM
 #TODO: CONSIDER ON OFFENSE:
 """
+3. Capsule planning on offense, not only in escape
 4. Dynamic carry threshold instead of a fixed CARRY_THRESHOLD
 6. Smarter “food escape” when running away (specifically ghost proximity)
 """
 
 
-#TODO: PACMAN KILLING HIMSELF GOING INTO THEIR TERRITORY
+#TODO: IF GETTING CHASED TOO LONG AND NOT GETTING ANY FOOD => RETURN HOME (POTENTIONALLY SOME FOOD LEVEL DANGER LOGIC / being chased?)
+
