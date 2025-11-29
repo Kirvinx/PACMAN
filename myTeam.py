@@ -30,6 +30,8 @@ class TeamContext:
         self.last_assignment_turn = -1
 
         self.food_danger = {}   # (x, y) -> danger score
+        self.last_on_enemy_side = {}      # idx -> bool
+        self.double_defense_active = False
 
         # Distancer shared for this team+layout
         self.distancer = Distancer(game_state.data.layout)
@@ -176,9 +178,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         """Main action selection with dynamic role switching."""
         # Update mode based on game state
         self._update_mode(game_state)
-        
-        # Update shared mode
-        self.ctx.modes[self.index] = self.mode
+      
 
         # Advance motion model (only lowest index agent)
         is_leader = self.index == min(self.team_indices)
@@ -217,16 +217,79 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             return Directions.STOP
 
     def _update_mode(self, game_state):
-        """Fixed role assignment: one always offense, one always defense."""
-        
-        team = sorted(self.team_indices)
-        attacker = team[0]
-        defender = team[1]
+        """
+        Decide offense/defense roles for the whole team.
 
-        if self.index == attacker:
-            self.mode = "defense"
+        Recomputed on every call. Modes are stored in ctx.modes and
+        each agent just reads its own entry.
+        """
+        team = sorted(self.team_indices)
+
+        # Ensure context fields exist (defensive check)
+        if not hasattr(self.ctx, "last_on_enemy_side"):
+            self.ctx.last_on_enemy_side = {}
+        if not hasattr(self.ctx, "double_defense_active"):
+            self.ctx.double_defense_active = False
+
+        # 1) Score: are we winning?
+        raw_score = game_state.get_score()
+        we_winning = (raw_score > 0) if self.red else (raw_score < 0)
+
+        # 2) Is there an enemy Pacman on our side?
+        intruder_here = self._intruder_inside_or_past_entrance(game_state)
+
+        # 3) Did any of *our* agents just come back from enemy side?
+        any_just_returned = False
+        for idx in team:
+            st = game_state.get_agent_state(idx)
+            pos = st.get_position() if st else None
+
+            if pos is None:
+                continue
+
+            on_enemy = self._is_on_enemy_side_pos(game_state, pos)
+            was_on_enemy = self.ctx.last_on_enemy_side.get(idx, on_enemy)
+
+            # “just returned home from enemy side”
+            if was_on_enemy and not on_enemy:
+                any_just_returned = True
+
+            self.ctx.last_on_enemy_side[idx] = on_enemy
+
+        # 4) Update persistent "double defense" flag
+        if self.ctx.double_defense_active:
+            # Leave double-defense mode once the intruder is gone.
+            if not intruder_here:
+                print("ended")
+                self.ctx.double_defense_active = False
         else:
-            self.mode = "offense"
+            # Trigger double-defense when:
+            #   - we are winning
+            #   - there is an intruder
+            #   - someone just came back from enemy side
+            if we_winning and intruder_here and any_just_returned:
+                print("True")
+                self.ctx.double_defense_active = True
+
+        # 5) Assign modes for this turn
+        modes = {}
+
+        if self.ctx.double_defense_active:
+            # Both defend
+            for idx in team:
+                modes[idx] = "defense"
+        else:
+            # Default: 1 defender (lower index), 1 attacker (higher index)
+            defender = team[0]
+            attacker = team[1]
+            modes[defender] = "defense"
+            modes[attacker] = "offense"
+
+        self.ctx.modes = modes
+
+        # Everyone reads their mode
+        self.mode = self.ctx.modes.get(self.index, "offense")
+
 
     # ==================== OFFENSIVE BEHAVIOR TREE ====================
 
