@@ -709,6 +709,11 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         if not pocket or pocket not in self.topology.off_pockets:
             return False
 
+        capsules = self.get_capsules(game_state)
+        for c in capsules:
+            if self.topology.pocket_id.get(c) == pocket:
+                return False
+
         exits = list(self.topology.pocket_exits[pocket])
         door = min(exits, key=lambda e: self.get_maze_distance(my_pos, e))
 
