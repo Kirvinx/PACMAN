@@ -32,6 +32,7 @@ class TeamContext:
         self.food_danger = {}   # (x, y) -> danger score
         self.last_on_enemy_side = {}      # idx -> bool
         self.double_defense_active = False
+        self.respawn_defenders = set()
 
         # Distancer shared for this team+layout
         self.distancer = Distancer(game_state.data.layout)
@@ -55,7 +56,7 @@ class UnifiedBeliefBTAgent(CaptureAgent):
     _contexts = {}
 
     # Offensive constants
-    CARRY_THRESHOLD = 10
+    CARRY_THRESHOLD = 50
     ESCAPE_PELLET_RISK_FACTOR = 0.9
     MIN_DEADLOCK_DIST = 2
     DEADLOCK_COMMIT = 10
@@ -230,13 +231,15 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             self.ctx.last_on_enemy_side = {}
         if not hasattr(self.ctx, "double_defense_active"):
             self.ctx.double_defense_active = False
+        if not hasattr(self.ctx, "respawn_defenders"):
+            self.ctx.respawn_defenders = set()
 
         # 1) Start from a simple baseline assignment
         modes = self._assign_default_roles(team)
 
         # 2) Apply switches (each switch is one function)
-        modes = self._switch_double_defense(game_state, team, modes)
-        # future: modes = self._switch_desperate_offense(game_state, team, modes)
+        #modes = self._switch_double_defense(game_state, team, modes)
+        #modes = self._switch_respawn_defense(game_state, team, modes)
         # future: modes = self._switch_power_play(game_state, team, modes)
         # ...
 
@@ -253,8 +256,8 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         modes = {}
         defender = team[0]
         attacker = team[1]
-        modes[defender] = "defense"
-        modes[attacker] = "offense"
+        modes[defender] = "offense"
+        modes[attacker] = "defense"
         return modes
 
     def _switch_double_defense(self, game_state, team, modes):
@@ -305,6 +308,56 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         # 5) If switch is active, override current modes
         if self.ctx.double_defense_active:
             for idx in team:
+                modes[idx] = "defense"
+
+        return modes
+
+    def _switch_respawn_defense(self, game_state, team, modes):
+        """
+        Switch: if an agent is sitting on its spawn tile (i.e., just respawned),
+        there is already another defender, and there is an enemy Pacman on our
+        side, temporarily turn that agent into an extra defender until the
+        intruder leaves our side.
+
+        Uses persistent set: ctx.respawn_defenders.
+        """
+        intruder_here = self._intruder_inside_or_past_entrance(game_state)
+
+        # If the intruder is gone, drop all respawn-based defenders.
+        if not intruder_here:
+            self.ctx.respawn_defenders.clear()
+            return modes
+
+        # Intruder is on our side: check each teammate for respawn-condition.
+        for idx in team:
+            st = game_state.get_agent_state(idx)
+            if not st:
+                continue
+
+            pos = st.get_position()
+            if not pos:
+                continue
+
+            spawn_pos = game_state.get_initial_agent_position(idx)
+
+            # Candidate: currently exactly on its spawn tile
+            if pos != spawn_pos:
+                continue
+
+            # There must already be *another* defender
+            has_other_defender = any(
+                j != idx and modes.get(j) == "defense"
+                for j in team
+            )
+            if not has_other_defender:
+                continue
+
+            # Mark this agent as a respawn-based defender for as long as intruder stays
+            self.ctx.respawn_defenders.add(idx)
+
+        # Apply: everyone in respawn_defenders plays defense while intruder_here
+        for idx in self.ctx.respawn_defenders:
+            if idx in modes:
                 modes[idx] = "defense"
 
         return modes
@@ -652,27 +705,65 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         return path[0] if path else self._safe_fallback(game_state)
 
     def _pick_food_target(self, game_state, my_pos, food_list, dual):
-        """Pick food target based on mode."""
+        """Pick food target based on mode (single/dual), with optional capsule override."""
         if not food_list:
             return None
-        
+
+        # --- Find global capsule candidate (if any) ---
+        capsule = self._find_capsule_candidate(game_state, food_list)
+
         if dual:
+            # Dual-attacker coordination: only one of us should pick the capsule.
             mate_info = self._get_teammate_info(game_state)
+            if mate_info and capsule is not None:
+                mate_idx, mate_pos, mate_target = mate_info
+                # If teammate position unknown, fall back to normal logic
+                if mate_pos:
+                    d_self = self.get_maze_distance(my_pos, capsule)
+                    d_mate = self.get_maze_distance(mate_pos, capsule)
+
+                    # Decide which attacker is "owner" of the capsule:
+                    # closer one wins; on tie, smaller index wins.
+                    i_am_capsule_taker = (
+                        d_self < d_mate or
+                        (d_self == d_mate and self.index < mate_idx)
+                    )
+
+                    if i_am_capsule_taker:
+                        return capsule
+                    # else: we skip capsule and just pick food below
+
+            # --- normal dual-food selection (unchanged) ---
             if not mate_info:
+                # No teammate info; treat as single
+                if capsule is not None:
+                    return capsule
                 return self._pick_food_single(game_state, my_pos, food_list)
-            
+
             _, mate_pos, mate_target = mate_info
             ref_pos = mate_target or mate_pos
-            
-            non_overlap = [f for f in food_list 
-                         if self.get_maze_distance(f, ref_pos) >= 3]
+
+            non_overlap = [
+                f for f in food_list
+                if self.get_maze_distance(f, ref_pos) >= 3
+            ]
             if not non_overlap:
                 return None
-            
-            return min(non_overlap, key=lambda f: 
-                      self.get_maze_distance(my_pos, f) - 0.6 * self.get_maze_distance(ref_pos, f))
+
+            return min(
+                non_overlap,
+                key=lambda f: (
+                    self.get_maze_distance(my_pos, f)
+                    - 0.6 * self.get_maze_distance(ref_pos, f)
+                )
+            )
+
         else:
+            # Single-attacker: if capsule is valid, we just take it.
+            if capsule is not None:
+                return capsule
             return self._pick_food_single(game_state, my_pos, food_list)
+
 
     def _pick_food_single(self, game_state, my_pos, food_list):
         """Single agent food selection."""
@@ -699,6 +790,58 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             if r <= cumulative:
                 return f
         return candidates[0][1]
+
+    def _find_capsule_candidate(self, game_state, food_list):
+        """
+        Decide if there is a capsule that we should treat as a food target.
+
+        Conditions:
+          - Enemy does NOT have 2 attackers (i.e. < 2 opponents are Pacman)
+          - Capsule is on enemy side
+          - For the chosen capsule, ALL food tiles have strictly higher danger
+            than the capsule (danger = trap depth via get_food_danger).
+
+        Returns:
+            capsule_pos or None
+        """
+        capsules = self.get_capsules(game_state)
+        if not capsules:
+            return None
+
+        # 1) Check enemy attackers: must be < 2 Pacmen
+        num_enemy_attackers = sum(
+            1
+            for opp in self.opponents
+            if (st := game_state.get_agent_state(opp)) and st.is_pacman
+        )
+        if num_enemy_attackers >= 2:
+            return None
+
+        # 2) Only consider capsules on enemy side
+        enemy_capsules = [
+            c for c in capsules
+            if self._is_on_enemy_side_pos(game_state, c)
+        ]
+        if not enemy_capsules:
+            return None
+
+        # 3) Pick the "best" capsule by (danger, arbitrary tiebreak by coord)
+        def cap_danger(c):
+            return self.get_food_danger(c)
+
+        candidate = min(
+            enemy_capsules,
+            key=lambda c: (cap_danger(c), c[0], c[1])
+        )
+        candidate_danger = cap_danger(candidate)
+
+        # 4) Require: all food danger > capsule danger
+        #    (if no food, caller should already have bailed out)
+        for f in food_list:
+            if self.get_food_danger(f) <= candidate_danger:
+                return None
+
+        return candidate
 
     def _safe_to_enter_trap(self, game_state, my_pos, food_pos):
         """Check if safe to enter trap for food."""
@@ -1065,37 +1208,77 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         return Directions.STOP if Directions.STOP in legal and not is_suicide(my_pos) else Directions.STOP
 
     def _panic_move(self, game_state, ghosts):
-        """Panic movement away from ghosts."""
+        """Panic movement away from ghosts, topology-aware."""
+        print("panic")
         if not ghosts:
             return None
-        
+
         legal = game_state.get_legal_actions(self.index)
-        my_pos = game_state.get_agent_state(self.index).get_position()
+        my_state = game_state.get_agent_state(self.index)
+        my_pos = my_state.get_position() if my_state else None
         if not my_pos or not legal:
             return None
-        
-        home_progress = lambda p: 1 if (p[0] < my_pos[0] if self.red else p[0] > my_pos[0]) else 0
-        
-        best_score = float("-inf")
-        best_action = None
-        
+
+        my_depth = self.topology.trap_depth(my_pos)
+
+        # Home target: nearest home-border tile from our current position
+        home_tiles = self._get_home_tiles(game_state)
+        if home_tiles:
+            home_target = min(home_tiles, key=lambda t: self.get_maze_distance(my_pos, t))
+        else:
+            home_target = my_pos
+
+        candidates = []  # (action, succ_pos, ghost_dist, depth, home_dist)
+
         for action in legal:
             if action == Directions.STOP:
                 continue
-            
+
             succ = game_state.generate_successor(self.index, action)
-            succ_pos = succ.get_agent_state(self.index).get_position()
+            succ_state = succ.get_agent_state(self.index)
+            succ_pos = succ_state.get_position() if succ_state else None
             if not succ_pos:
                 continue
-            
+
             ghost_dist = min(self.get_maze_distance(succ_pos, g) for g in ghosts)
-            trap_penalty = 5 * self.topology.trap_depth(succ_pos)
-            score = 3.0 * ghost_dist + home_progress(succ_pos) - trap_penalty
-            
-            if score > best_score:
-                best_score = score
-                best_action = action
-        
+            depth = self.topology.trap_depth(succ_pos)
+            home_dist = self.get_maze_distance(succ_pos, home_target)
+
+            candidates.append((action, succ_pos, ghost_dist, depth, home_dist))
+
+        if not candidates:
+            return None
+
+        # Hard suicide filter: avoid tiles a ghost can reach in 1 step if at all possible
+        safe = [c for c in candidates if c[2] > 1]  # c[2] = ghost_dist
+        base = safe if safe else candidates
+
+        # Now sort lexicographically according to your priorities
+        if my_depth == 0:
+            # NOT in trap:
+            #   1) avoid entering traps (depth == 0 preferred)
+            #   2) maximize ghost distance
+            #   3) minimize distance to home
+            base.sort(key=lambda c: (
+                c[3] > 0,     # True (1) if we step into trap, False (0) if we stay out
+                -c[2],        # -ghost_dist → larger distance is better
+                c[4],         # home_dist → closer to home is better
+                str(c[0]),    # tie-breaker
+            ))
+        else:
+            # IN trap:
+            #   1) reduce trap depth
+            #   2) maximize ghost distance
+            #   3) minimize distance to home
+            base.sort(key=lambda c: (
+                c[3],         # depth → smaller is better (0 = out of trap)
+                -c[2],        # maximize distance to ghost
+                c[4],         # closer to home
+                str(c[0]),
+            ))
+
+        best_action = base[0][0]
+        # print("panic move", self.index, "->", best_action, "candidates:", base)  # optional debug
         return best_action
 
     def _should_hurry_home(self, game_state):
@@ -1711,6 +1894,32 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             tiles = tiles[:-1]
 
         return set(tiles)
+
+    def final(self, game_state):
+        """
+        Called by the framework at the end of a game.
+        Use this to clear only this game's shared context so it
+        doesn't leak into the next game.
+        """
+        # Let parent do its bookkeeping (observationHistory etc.)
+        try:
+            super().final(game_state)
+        except AttributeError:
+            # In case CaptureAgent doesn't define final in your version
+            pass
+
+        # Only one agent per team should clear the shared context for this game
+        team = tuple(sorted(self.get_team(game_state)))
+        leader = team[0]
+
+        if self.index == leader:
+            game_id = id(game_state.data)
+            ctx_key = (game_id, team)
+
+            # Remove only this game's context if it exists
+            if ctx_key in self.__class__._contexts:
+                del self.__class__._contexts[ctx_key]
+
 
 
 #TODO: AFTERWARDS, BETTER SWITCHING BETWEEN THEM
