@@ -3,19 +3,41 @@ from collections import deque
 from contest.capture_agents import CaptureAgent
 from contest.game import Directions
 from contest.util import manhattan_distance
+from contest.util import nearest_point
 
 # Behavior tree nodes
-from contest.agents.team_name_1.baseline.behavior_tree import (
+from supplementary_materials.behavior_tree import (
     Selector, Sequence, Condition, Action
 )
 
 # Utilities
-from contest.agents.team_name_1.beliefline.exits import TerritoryAnalyzer
-from contest.agents.team_name_1.beliefline.topology import MapTopologyAnalyzer
-from contest.agents.team_name_1.beliefline.pathfinding_belief_opt import AStarPathfinder
-from contest.agents.team_name_1.beliefline.pathfinding_defensive import DefensiveAStarPathfinder
-from contest.agents.team_name_1.beliefline.belief_shared import GhostBeliefTracker
+from supplementary_materials.exits import TerritoryAnalyzer
+from supplementary_materials.topology import MapTopologyAnalyzer
+from supplementary_materials.pathfinding_belief_opt import AStarPathfinder
+from supplementary_materials.pathfinding_defensive import DefensiveAStarPathfinder
+from supplementary_materials.belief_shared import GhostBeliefTracker
 from contest.distance_calculator import Distancer
+
+from contest.baseline_team import DefensiveReflexAgent
+from contest.baseline_team import OffensiveReflexAgent
+
+def create_team(first_index, second_index, is_red,
+                first='OffensiveReflexAgent', second='DefensiveReflexAgent', num_training=0):
+    """
+    This function should return a list of two agents that will form the
+    team, initialized using firstIndex and secondIndex as their agent
+    index numbers.  isRed is True if the red team is being created, and
+    will be False if the blue team is being created.
+
+    As a potentially helpful development aid, this function can take
+    additional string-valued keyword arguments ("first" and "second" are
+    such arguments in the case of this function), which will come from
+    the --redOpts and --blueOpts command-line arguments to capture.py.
+    For the nightly contest, however, your team will be created without
+    any extra arguments, so you should make sure that the default
+    behavior is what you want for the nightly contest.
+    """
+    return [UnifiedBeliefBTAgent(first_index), UnifiedBeliefBTAgent(second_index) ]
 
 class TeamContext:
     def __init__(self, game_state, team_indices, opponents, is_red, agent):
