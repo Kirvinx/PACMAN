@@ -16,7 +16,7 @@ class MapTopologyAnalyzer:
 
     Stage 2: Trap-region analysis
       • Removes articulation tiles to find disconnected pockets
-      • Identifies the main region vs smaller “off pockets”
+      • Identifies the main region vs smaller "off pockets"
       • Computes per-tile risk depth inside off pockets
         (distance to nearest articulation door)
       • Assigns risk = 1 to doors and dead-ends directly next to junctions
@@ -165,7 +165,7 @@ class MapTopologyAnalyzer:
             self.compressed_adj[node] = [(nb, d) for nb, d in uniq.items()]
 
     def _compute_articulation_points(self):
-        """Run Tarjan’s algorithm on the compressed graph to find articulation points."""
+        """Run Tarjan's algorithm on the compressed graph to find articulation points."""
         index, lowlink = {}, {}
         current = [0]
         self.articulation_nodes = set()
@@ -206,63 +206,107 @@ class MapTopologyAnalyzer:
 
     def _prune_nested_articulations_on_compressed(self):
         """
-        Keep only 'first layer' articulation nodes: those that touch the main
-        non-articulation component in the compressed graph. Deeper ones are pruned.
+        Keep only 'first layer' articulation nodes.
+
+        Main component = the unique one that:
+          • spans both sides across the vertical midline
+          • is self-symmetric under 180° rotation
         """
         if not self.articulation_nodes:
             return
 
-        # 1) Connected components of NON-articulation compressed nodes
+        # ---- 1. Find components of NON-articulation compressed nodes ----
         comp_id = {}
-        comp_sizes = []
+        components = []
 
         for node in self.compressed_nodes:
             if node in self.articulation_nodes or node in comp_id:
                 continue
 
-            cid = len(comp_sizes)
+            cid = len(components)
             stack = [node]
             comp_id[node] = cid
-            size = 0
+            comp_nodes = {node}
 
             while stack:
                 u = stack.pop()
-                size += 1
                 for v, _ in self.compressed_adj.get(u, []):
                     if v in self.articulation_nodes or v in comp_id:
                         continue
                     comp_id[v] = cid
+                    comp_nodes.add(v)
                     stack.append(v)
 
-            comp_sizes.append(size)
+            components.append(comp_nodes)
 
-        if not comp_sizes:
+        if not components:
             return
 
-        # 2) Choose main component (largest non-articulation component)
-        main_comp = max(range(len(comp_sizes)), key=lambda i: comp_sizes[i])
+        # ---- 2. Use shared method to identify main component ----
+        main_comp = self._find_main_component_id(components)
 
-        # 3) Keep only articulations that border the main component
+        # ---- 3. Keep only articulations that border the main component ----
         filtered = set()
         for a in self.articulation_nodes:
-            neighbor_comps = set()
             for v, _ in self.compressed_adj.get(a, []):
                 if v in self.articulation_nodes:
                     continue
                 cid = comp_id.get(v)
-                if cid is not None:
-                    neighbor_comps.add(cid)
-
-            # "First" articulation layer: has at least one neighbor in main_comp
-            if main_comp in neighbor_comps:
-                filtered.add(a)
+                if cid == main_comp:
+                    filtered.add(a)
+                    break
 
         self.articulation_nodes = filtered
-
 
     # ----------------------------------------------------------------------
     # Stage 2: Pockets and risk propagation
     # ----------------------------------------------------------------------
+
+    def _find_main_component_id(self, components):
+        """
+        Given a list of components (each a set or list of (x,y)), return the index
+        of the 'main' component — the one that:
+          • spans both sides of the vertical midline
+          • is self-symmetric under 180° rotation
+        Fallback: largest component.
+        """
+        mid_x = (self.width - 1) / 2.0
+
+        def spans_both_sides(nodes):
+            left  = any(x < mid_x for x, y in nodes)
+            right = any(x > mid_x for x, y in nodes)
+            return left and right
+
+        def rotate180(nodes):
+            return {
+                (self.width - 1 - x, self.height - 1 - y)
+                for (x, y) in nodes
+            }
+
+        candidates = []
+        symmetric_only = []
+
+        for i, nodes in enumerate(components):
+            # Convert to set if it's a list (for pockets which are lists)
+            if isinstance(nodes, list):
+                nodes_set = set(nodes)
+            else:
+                nodes_set = nodes
+                
+            rotated = rotate180(nodes_set)
+            symmetric = (rotated == nodes_set)
+
+            if symmetric:
+                symmetric_only.append(i)
+                if spans_both_sides(nodes_set):
+                    candidates.append(i)
+
+        if candidates:
+            return candidates[0]
+        if symmetric_only:
+            return symmetric_only[0]
+
+        return max(range(len(components)), key=lambda i: len(components[i]))
 
     def _compute_pocket_regions(self):
         """Split map into pockets after removing articulation tiles."""
@@ -294,7 +338,8 @@ class MapTopologyAnalyzer:
                 self.pocket_id[p] = idx
 
         if self.pockets:
-            self.main_pocket = max(range(len(self.pockets)), key=lambda i: len(self.pockets[i]))
+            # Use the shared method to identify main component
+            self.main_pocket = self._find_main_component_id(self.pockets)
             self.off_pockets = [i for i in range(len(self.pockets)) if i != self.main_pocket]
         else:
             self.main_pocket = None
