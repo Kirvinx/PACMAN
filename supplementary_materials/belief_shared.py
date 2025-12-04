@@ -132,8 +132,8 @@ class GhostBeliefTracker:
             self.beliefs[opp] = new_belief
 
         # Apply additional constraints
+        self._filter_side_constraints(game_state)
         if is_leader:
-            self._filter_side_constraints(game_state)
             eaten = self._detect_eaten_food(game_state)
             self._incorporate_eaten_food(eaten)
 
