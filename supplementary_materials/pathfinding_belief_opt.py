@@ -1,8 +1,8 @@
 import heapq
 import math
-from collections import deque  # <-- NEW
-from contest.game import Directions, Actions
-from contest.util import manhattan_distance, nearest_point
+from collections import deque
+from contest.game import Directions
+from contest.util import nearest_point
 
 
 class AStarPathfinder:
@@ -18,7 +18,15 @@ class AStarPathfinder:
             (Directions.WEST, (-1, 0))
         ]
 
-    def find_path(self, game_state, start, goal, avoid_enemies=True, return_cost=False, avoid_instant_death=True):
+    def find_path(self, game_state, start, goal,
+              avoid_enemies=True,
+              return_cost=False,
+              avoid_instant_death=True,
+              avoid_path_tiles=None,         
+              lambda_path_overlap=0.0,       
+              overlap_border_only=False,      
+              border_band=3):             
+
         """
         Belief-based A* pathfinding:
         - Path cost = steps + λ * danger
@@ -33,6 +41,9 @@ class AStarPathfinder:
         start, goal = (int(start[0]), int(start[1])), (int(goal[0]), int(goal[1]))
 
         width, height = walls.width, walls.height
+
+        mid_x = width // 2
+        border_x = mid_x - 1 if self.agent.red else mid_x
 
         # Cache danger map per timestep
         current_timestep = game_state.data.timeleft if hasattr(game_state.data, 'timeleft') else 0
@@ -79,7 +90,20 @@ class AStarPathfinder:
 
                 # Risk cost from belief-based danger map
                 danger_cost = lambda_risk * danger_map[nx][ny] if avoid_enemies and danger_map else 0.0
-                new_g = g + 1.0 + danger_cost
+                # --- NEW: overlap penalty for using teammate's path near the border ---
+                overlap_cost = 0.0
+                if avoid_path_tiles is not None and (nx, ny) in avoid_path_tiles and lambda_path_overlap > 0.0:
+                    if not overlap_border_only:
+                        overlap_cost = lambda_path_overlap
+                    else:
+                        # Only penalize if we are within [border_band] columns of home border,
+                        # and still on our home side.
+                        if abs(nx - border_x) <= border_band:
+                            on_home_side = (nx < mid_x) if self.agent.red else (nx >= mid_x)
+                            if on_home_side:
+                                overlap_cost = lambda_path_overlap
+
+                new_g = g + 1.0 + danger_cost + overlap_cost
 
                 if (nx, ny) in best_g and new_g >= best_g[(nx, ny)] - 1e-6:
                     continue
