@@ -1358,7 +1358,6 @@ class UnifiedBeliefBTAgent(CaptureAgent):
         capsules = self.get_capsules(game_state)
         for c in capsules:
             if self.topology.pocket_id.get(c) == pocket:
-                print("capsule")
                 return False
 
         depth = self.topology.trap_depth(my_pos)
@@ -1391,7 +1390,6 @@ class UnifiedBeliefBTAgent(CaptureAgent):
             # no known ghost → don't abort purely by trap logic
             return False
 
-        print(min_ghost_time <= required_safe_time)
         # If ghost is already too close according to the 2*d+1 rule → abort
         return min_ghost_time <= required_safe_time
 
